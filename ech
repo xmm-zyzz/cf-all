@@ -5,21 +5,22 @@ const fallbackAddress = 'all.ai9527.top';
 const fallbackPort = '443';
 const socks5Config = '';
 
+// ---------------------- ECH 设置（默认开启） ----------------------
+// 说明：ECH（Encrypted ClientHello）的配置（ECHConfig）在很多服务上会定期轮换（常见约 24h）。
+// 如果把“具体的 ECHConfig”硬编码到订阅里，客户端不刷新订阅就可能在一天后失效。
+// 因此这里默认使用“查询模式”：在链接里写入 ech=<ECH_DOMAIN>+<DoH_URL>
+// 让客户端在每次连接时通过 DoH 去查询 ECH_DOMAIN 的 HTTPS(SVCB) 记录，从而拿到最新 ECHConfig，避免 1 天游离失效。
+// 如需兼容只接受“具体 ECHConfig”的客户端，可在订阅 URL 上加 ?echMode=config。
+// Worker 会自动每 20 小时刷新一次 ECHConfig 并写入订阅（仍建议客户端按日刷新订阅）。
 
-// === ECH / TLS / Fingerprint / Clash settings ===
+const ECH_DEFAULT_ENABLED = true;
+const ECH_DEFAULT_MODE = 'query';  // 'query' | 'config'
+const ECH_QUERY_NAME_DEFAULT = 'cloudflare-ech.com';
+const ECH_DOH_DEFAULT = 'https://cloudflare-dns.com/dns-query';
+const ECH_CACHE_TTL_MS = 20 * 60 * 60 * 1000; // 20 hours
 
-const enableECH = true;
+let ECH_MEM_CACHE = { key: '', value: null, fetchedAt: 0 };
 
-const customDNS = 'https://dns.alidns.com/dns-query';
-
-const customECHDomain = 'cloudflare-ech.com';
-
-const forceTLS = true;
-
-const clashConverterService = 'https://url.v1.mk/sub';
-
-
-let echDebugInfo = '';
 
 const parsedSocks5Config = {};
 const isSocksEnabled = false;
@@ -56,7 +57,7 @@ export default {
 					return new Response(successHtml, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 				}
 				if (url.pathname.toLowerCase().includes(`/${subPath}`)) {
-					return await handleSubscriptionRequest(request, authToken);
+					return await handleSubscriptionRequest(request, authToken, ctx);
 				}
 			}
 			return new Response('Not Found', { status: 404 });
@@ -66,69 +67,57 @@ export default {
 	},
 };
 
-async function handleSubscriptionRequest(request, uuid) {
+async function handleSubscriptionRequest(request, uuid, ctx) {
     const url = new URL(request.url);
     const finalLinks = [];
     const workerDomain = url.hostname;
 
-    const target = (url.searchParams.get('target') || url.searchParams.get('format') || '').toLowerCase();
-    const ua = request.headers.get('User-Agent') || '';
-    const explicitBase64 = target === 'base64';
-    const wantClash = !explicitBase64 && (target === 'clash' || url.searchParams.has('clash') || /clash/i.test(ua));
-
+    // ---------------------- ECH 参数（默认开启） ----------------------
+    // 用法（订阅 URL 参数）：
+    //   ?ech=0                 关闭 ECH
+    //   ?ech=1                 开启 ECH（默认就是 1）
+    //   ?echMode=query         （默认）写入 ech=<domain>+<doh>，由客户端每次连接实时查询，避免“1天后失效”
+    //   ?echMode=config        写入具体 ECHConfig（Worker 每 20 小时刷新一次），用于兼容少数不支持 query 模式的客户端
+    //   ?echDomain=xxx         指定查询用域名（默认 cloudflare-ech.com）
+    //   ?echDoh=https://...    指定 DoH（默认 Cloudflare DoH）
+    const echEnabled = parseBool(url.searchParams.get('ech'), ECH_DEFAULT_ENABLED);
+    const echMode = (url.searchParams.get('echMode') || ECH_DEFAULT_MODE).toLowerCase();
+    const echDomain = (url.searchParams.get('echDomain') || ECH_QUERY_NAME_DEFAULT).trim();
+    const echDoh = (url.searchParams.get('echDoh') || ECH_DOH_DEFAULT).trim();
 
     let echParam = null;
-    if (enableECH) {
-        echParam = `${customECHDomain}+${customDNS}`;
-        const echMode = (url.searchParams.get('echmode') || '').toLowerCase();
+    if (echEnabled) {
         if (echMode === 'config') {
-            const fetched = await fetchECHConfig(customECHDomain);
-            if (fetched) echParam = fetched;
+            echParam = await getEchConfigAuto(ctx, echDomain, echDoh);
+            // 如果拉取失败，自动降级到 query 模式，避免“1天后失效”且不影响使用
+            if (!echParam) echParam = buildEchQueryParam(echDomain, echDoh);
+        } else {
+            // 默认 query 模式：不会因为 ECHConfig 轮换而失效
+            echParam = buildEchQueryParam(echDomain, echDoh);
         }
     }
+
+
+    // 已删除：原生地址
+    // 已删除：直连域名
+    // 已删除：动态优选 IP
 
     const newIPList = await fetchAndParseNewIPs();
     if (newIPList.length > 0) {
-        finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain, echParam));
+        finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain, echParam, echEnabled));
     }
 
     if (finalLinks.length === 0) {
-        const wsPath = encodeURIComponent('/?ed=2048');
-        const fpValue = enableECH ? 'chrome' : 'randomized';
-        const wsParams = new URLSearchParams({
-            encryption: 'none',
-            security: 'tls',
-            sni: workerDomain,
-            fp: fpValue,
-            type: 'ws',
-            host: workerDomain,
-            path: wsPath,
-            ...(enableECH ? { alpn: 'h3,h2,http/1.1', ech: echParam || `${customECHDomain}+${customDNS}` } : {})
-        });
-        const errorLink = `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:443?${wsParams.toString()}#${encodeURIComponent(errorRemark)}`;
+        // 修复原代码中未定义的 errorRemark 变量
+        const errorRemark = "No Available IPs"; 
+        const errorLink = `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:80?encryption=none&security=none&type=ws&host=error.com&path=%2F#${encodeURIComponent(errorRemark)}`;
         finalLinks.push(errorLink);
     }
 
-    if (wantClash) {
-        try {
-            const clashConfig = await generateClashConfig(request);
-            return new Response(clashConfig, {
-                headers: {
-                    'Content-Type': 'text/yaml; charset=utf-8',
-                    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-                },
-            });
-        } catch (e) {
-            return new Response(String(e?.message || e), {
-                status: 500,
-                headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-            });
-        }
-    }
-
     const subscriptionContent = btoa(finalLinks.join('\n'));
+    
     return new Response(subscriptionContent, {
-        headers: {
+        headers: { 
             'Content-Type': 'text/plain; charset=utf-8',
             'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
         },
@@ -171,151 +160,34 @@ async function fetchAndParseNewIPs() {
     }
 }
 
-async function generateClashConfig(request) {
-    const subscriptionUrl = new URL(request.url);
-
-    subscriptionUrl.searchParams.set('target', 'base64');
-    subscriptionUrl.searchParams.delete('clash');
-    subscriptionUrl.searchParams.delete('format');
-
-    const encodedUrl = encodeURIComponent(subscriptionUrl.toString());
-    const converterUrl = `${clashConverterService}?target=clash&url=${encodedUrl}&insert=false&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&new_name=true`;
-
-    const response = await fetch(converterUrl);
-    if (!response.ok) {
-        throw new Error(`订阅转换服务失败: ${response.status}`);
-    }
-
-    let clashConfig = await response.text();
-
-    // 如果启用 ECH：尽量为节点补齐 ech-opts（主要针对 flow mapping 单行格式）
-    if (enableECH) {
-        const echDomain = customECHDomain || 'cloudflare-ech.com';
-        clashConfig = clashConfig.split('\n').map(line => {
-            if (/^\s*-\s*\{/.test(line) && line.includes('name:') && line.includes('server:')) {
-                if (line.includes('ech-opts')) return line;
-                const lastBraceIndex = line.lastIndexOf('}');
-                if (lastBraceIndex > 0) {
-                    const beforeBrace = line.substring(0, lastBraceIndex).trim();
-                    if (beforeBrace.length > 0) {
-                        const needsComma = !beforeBrace.endsWith(',') && !beforeBrace.endsWith('{');
-                        return line.substring(0, lastBraceIndex) +
-                            (needsComma ? ', ' : ' ') +
-                            `ech-opts: {enable: true, query-server-name: ${echDomain}}` +
-                            line.substring(lastBraceIndex);
-                    }
-                }
-            }
-            return line;
-        }).join('\n');
-    }
-
-    clashConfig = clashConfig.replace(/^(\s*nameserver:\s*\n)((?:\s*-\s*[^\n]+\n)*)/m, (match, header) => {
-        const dnsServer = customDNS || 'https://dns.alidns.com/dns-query';
-        return header + `    - ${dnsServer}\n`;
-    });
-
-    return clashConfig;
-}
-
-async function fetchECHConfig(domain) {
-    if (!enableECH) {
-        echDebugInfo = 'ECH 功能已禁用';
-        return null;
-    }
-
-    echDebugInfo = '';
-    const debugSteps = [];
-
-
-    const queryUrls = [
-        `https://v.recipes/dns/dns.google/dns-query?name=${encodeURIComponent(customECHDomain || 'cloudflare-ech.com')}&type=65`,
-        `https://v.recipes/dns/dns.google/dns-query?name=${encodeURIComponent(domain)}&type=65`
-    ];
-
-    try {
-        for (const u of queryUrls) {
-            debugSteps.push(`请求: ${u}`);
-            const r = await fetch(u, { headers: { 'Accept': 'application/json' } });
-            debugSteps.push(`状态: ${r.status}`);
-            if (!r.ok) continue;
-
-            const data = await r.json();
-            if (!data || !data.Answer || !Array.isArray(data.Answer) || data.Answer.length === 0) {
-                debugSteps.push('无 Answer 记录');
-                continue;
-            }
-
-            debugSteps.push(`Answer 数: ${data.Answer.length}`);
-            for (const ans of data.Answer) {
-                if (!ans || !ans.data) continue;
-                const dataStr = typeof ans.data === 'string' ? ans.data : JSON.stringify(ans.data);
-
-                const echMatch = dataStr.match(/ech=([^\s"']+)/);
-                if (echMatch && echMatch[1]) {
-                    echDebugInfo = debugSteps.join('\n') + '\n✅ 成功解析到 ech= 参数';
-                    return echMatch[1];
-                }
-
-                try {
-                    const decoded = atob(String(ans.data));
-                    const decodedMatch = decoded.match(/ech=([^\s"']+)/);
-                    if (decodedMatch && decodedMatch[1]) {
-                        echDebugInfo = debugSteps.join('\n') + '\n✅ base64 解码后解析到 ech= 参数';
-                        return decodedMatch[1];
-                    }
-                } catch (_) {
-                    // ignore
-                }
-            }
-        }
-
-        echDebugInfo = debugSteps.join('\n') + '\n❌ 未解析到 ech= 参数';
-        return null;
-    } catch (e) {
-        echDebugInfo = debugSteps.join('\n') + `\n❌ 请求异常: ${e?.message || e}`;
-        return null;
-    }
-}
-
-function generateLinksFromNewIPs(list, uuid, workerDomain, echParam = null) {
+function generateLinksFromNewIPs(list, uuid, workerDomain, echParam = null, echEnabled = ECH_DEFAULT_ENABLED) {
     const links = [];
     const wsPath = encodeURIComponent('/?ed=2048');
     const proto = 'vless';
-
-    const CF_HTTPS_PORTS = new Set([443, 2053, 2083, 2087, 2096, 8443]);
-    const fallbackTlsPort = parseInt(fallbackPort, 10) || 443;
-
-    const fpValue = enableECH ? 'chrome' : 'randomized';
-
-    const defaultEchParam = `${customECHDomain}+${customDNS}`;
-    const echValue = enableECH ? (echParam || defaultEchParam) : null;
 
     list.forEach(item => {
         const nodeName = item.name;
         const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
 
-        const port = (forceTLS && !CF_HTTPS_PORTS.has(item.port)) ? fallbackTlsPort : item.port;
-
         const params = {
             encryption: 'none',
             security: 'tls',
             sni: workerDomain,
-            fp: fpValue,
+            fp: echEnabled ? 'chrome' : 'randomized',
             type: 'ws',
             host: workerDomain,
             path: wsPath
         };
 
-        if (enableECH) {
+        if (echEnabled && echParam) {
+            // ECH 建议搭配 Chrome 指纹 + ALPN，兼容性更好
             params.alpn = 'h3,h2,http/1.1';
-            params.ech = echValue;
+            params.ech = echParam;
         }
 
         const wsParams = new URLSearchParams(params);
-        links.push(`${proto}://${uuid}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(nodeName)}`);
+        links.push(`${proto}://${uuid}@${safeIP}:${item.port}?${wsParams.toString()}#${encodeURIComponent(nodeName)}`);
     });
-
     return links;
 }
 
@@ -512,3 +384,167 @@ function formatIdentifier(arr, offset = 0) {
     if (!isValidFormat(id)) throw new TypeError(E_INVALID_ID_STR);
     return id;
 }
+
+
+// ---------------------- ECH helpers ----------------------
+function parseBool(v, defaultVal = false) {
+    if (v === null || v === undefined || v === '') return defaultVal;
+    const s = String(v).trim().toLowerCase();
+    if (['1','true','yes','y','on','enable','enabled'].includes(s)) return true;
+    if (['0','false','no','n','off','disable','disabled'].includes(s)) return false;
+    return defaultVal;
+}
+
+// query 模式：把“查询域名 + DoH”写进订阅，客户端每次握手前会去 DoH 查询最新 ECHConfig，因此不会出现“1天后失效”
+function buildEchQueryParam(echDomain, dohUrl) {
+    return `${echDomain}+${dohUrl}`;
+}
+
+// config 模式：把“具体 ECHConfig”写进订阅（用于兼容少数客户端）
+// 为了避免常见的 24h 轮换导致失效，这里做了 20h 自动刷新 + Cache API 缓存
+async function getEchConfigAuto(ctx, echDomain, dohUrl) {
+    const now = Date.now();
+    const cacheKey = `${echDomain}@@${dohUrl}`;
+
+    // 1) 内存缓存（同一个 isolate 内命中最快）
+    if (ECH_MEM_CACHE.key === cacheKey && ECH_MEM_CACHE.value && (now - ECH_MEM_CACHE.fetchedAt) < ECH_CACHE_TTL_MS) {
+        return ECH_MEM_CACHE.value;
+    }
+
+    // 2) Cache API（跨请求缓存；注意：不同 PoP 可能各自缓存）
+    try {
+        const cache = caches.default;
+        const keyReq = new Request(`https://ech-cache.local/${encodeURIComponent(cacheKey)}`);
+        const cached = await cache.match(keyReq);
+        if (cached) {
+            const obj = await cached.json();
+            if (obj?.value && obj?.fetchedAt && (now - obj.fetchedAt) < ECH_CACHE_TTL_MS) {
+                ECH_MEM_CACHE = { key: cacheKey, value: obj.value, fetchedAt: obj.fetchedAt };
+                return obj.value;
+            }
+        }
+    } catch (_) {
+        // ignore
+    }
+
+    // 3) 拉取最新 ECHConfig
+    const endpoints = [];
+    if (dohUrl) endpoints.push(dohUrl);
+    if (dohUrl !== 'https://cloudflare-dns.com/dns-query') endpoints.push('https://cloudflare-dns.com/dns-query');
+    endpoints.push('https://dns.google/resolve');
+
+    // 优先 cloudflare-ech.com（很多情况下可用于 Cloudflare 全局），失败再查用户指定域名
+    const names = ['cloudflare-ech.com'];
+    if (echDomain && echDomain !== 'cloudflare-ech.com') names.push(echDomain);
+
+    for (const name of names) {
+        for (const ep of endpoints) {
+            const v = await fetchEchConfigFromDoh(name, ep);
+            if (v) {
+                const fetchedAt = Date.now();
+                ECH_MEM_CACHE = { key: cacheKey, value: v, fetchedAt };
+
+                try {
+                    const cache = caches.default;
+                    const keyReq = new Request(`https://ech-cache.local/${encodeURIComponent(cacheKey)}`);
+                    const body = JSON.stringify({ value: v, fetchedAt });
+                    const resp = new Response(body, {
+                        headers: {
+                            'Content-Type': 'application/json; charset=utf-8',
+                            'Cache-Control': `public, max-age=${Math.floor(ECH_CACHE_TTL_MS / 1000)}`
+                        }
+                    });
+                    if (ctx?.waitUntil) ctx.waitUntil(cache.put(keyReq, resp));
+                } catch (_) {
+                    // ignore
+                }
+
+                return v;
+            }
+        }
+    }
+
+    return null;
+}
+
+async function fetchEchConfigFromDoh(name, dohEndpoint) {
+    try {
+        let url;
+        let headers = {};
+
+        // dns.google/resolve 的 JSON API：?name=...&type=HTTPS
+        if (dohEndpoint.includes('/resolve')) {
+            url = `${dohEndpoint}?name=${encodeURIComponent(name)}&type=HTTPS`;
+        } else {
+            // 标准 DoH JSON：?name=...&type=65
+            url = `${dohEndpoint}?name=${encodeURIComponent(name)}&type=65`;
+            headers['Accept'] = 'application/dns-json';
+        }
+
+        const resp = await fetch(url, { headers });
+        if (!resp.ok) return null;
+
+        const data = await resp.json();
+        const answers = data.Answer || data.answer || [];
+        if (!Array.isArray(answers) || answers.length === 0) return null;
+
+        for (const ans of answers) {
+            const raw = ans.data ?? ans.rdata ?? '';
+            if (!raw) continue;
+            const v = extractEchFromHttpsRdata(raw);
+            if (v) return v;
+        }
+
+        for (const ans of answers) {
+            const raw = ans.data ?? '';
+            if (!raw || typeof raw !== 'string') continue;
+            if (raw.includes('ech=')) continue;
+            try {
+                const decoded = atob(raw);
+                const v = extractEchFromHttpsRdata(decoded);
+                if (v) return v;
+            } catch (_) {
+            }
+        }
+
+        return null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function extractEchFromHttpsRdata(rdata) {
+    const s = String(rdata);
+    const m =
+        s.match(/(?:^|\s)ech=([^\s"']+)/i) ||
+        s.match(/(?:^|\s)ech="([^"]+)"/i) ||
+        s.match(/(?:^|\s)echconfig=([^\s"']+)/i);
+    if (m?.[1]) return m[1].trim();
+    return null;
+}
+const HEX = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
+function bytesToUuid(arr, o) {
+  return (
+    HEX[arr[o]] +
+    HEX[arr[o + 1]] +
+    HEX[arr[o + 2]] +
+    HEX[arr[o + 3]] +
+    "-" +
+    HEX[arr[o + 4]] +
+    HEX[arr[o + 5]] +
+    "-" +
+    HEX[arr[o + 6]] +
+    HEX[arr[o + 7]] +
+    "-" +
+    HEX[arr[o + 8]] +
+    HEX[arr[o + 9]] +
+    "-" +
+    HEX[arr[o + 10]] +
+    HEX[arr[o + 11]] +
+    HEX[arr[o + 12]] +
+    HEX[arr[o + 13]] +
+    HEX[arr[o + 14]] +
+    HEX[arr[o + 15]]
+  );
+}
+

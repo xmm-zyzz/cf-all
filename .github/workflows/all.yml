@@ -1,4 +1,4 @@
-name: jp
+name: ech
 
 on:
   workflow_dispatch:

@@ -11,14 +11,6 @@ const ENABLE_ECH = true;
 
 const CSV_URL = "https://ccq-4bs.pages.dev/heads/main/hebing.csv?token=CCQ";
 
-const ECH_NAME = "cloudflare-ech.com";
-const ECH_SNI = "cloudflare-ech.com";
-
-const ECH_REFRESH_MS = 6 * 60 * 60 * 1000;
-
-let ECH_CACHE = { value: null, expiresAt: 0, inFlight: null };
-
-
 const AT_IPV4 = 1;
 const AT_DOMAIN = 2;
 const AT_IPV6 = 3;
@@ -59,7 +51,7 @@ async function handleSubscriptionRequest(request) {
   const url = new URL(request.url);
   const host = url.hostname;
 
-  const ech = ENABLE_ECH ? await getECH() : null;
+  const ech = ENABLE_ECH ? await fetchECH() : null;
 
   const nodes = await fetchCsvNodes(CSV_URL);
   const links = nodes.length
@@ -82,15 +74,13 @@ function buildVlessLink(uuid, ip, port, name, workerHost, ech) {
   const safeIP = ip.includes(":") ? `[${ip}]` : ip;
   const label = encodeURIComponent(name || `${ip}:${port}`);
 
-  const sni = ech ? ECH_SNI : workerHost;
-
   const p = new URLSearchParams({
     encryption: "none",
     security: "tls",
-    sni,
+    sni: workerHost,
     fp: ech ? "chrome" : "randomized",
     type: "ws",
-    host: workerHost,    
+    host: workerHost,
     path: WS_PATH,
   });
 
@@ -102,7 +92,6 @@ function buildVlessLink(uuid, ip, port, name, workerHost, ech) {
   return `vless://${uuid}@${safeIP}:${port}?${p.toString()}#${label}`;
 }
 
-
 async function fetchCsvNodes(csvUrl) {
   try {
     const r = await fetch(csvUrl, { signal: AbortSignal.timeout(8000) });
@@ -110,6 +99,7 @@ async function fetchCsvNodes(csvUrl) {
     const text = (await r.text()).trim().replace(/\r/g, "");
     if (!text) return [];
 
+    // 格式: ip:port#name
     const out = [];
     for (const line of text.split("\n")) {
       const s = line.trim();
@@ -124,95 +114,37 @@ async function fetchCsvNodes(csvUrl) {
   }
 }
 
-async function getECH() {
-  const now = Date.now();
-  if (ECH_CACHE.value && now < ECH_CACHE.expiresAt) return ECH_CACHE.value;
-  if (ECH_CACHE.inFlight) return ECH_CACHE.inFlight;
-
-  ECH_CACHE.inFlight = (async () => {
-    const { ech, ttlSec } = await fetchECHNoStale();
-
-    const ttlMsFromDns =
-      typeof ttlSec === "number" && ttlSec > 0 ? Math.floor(ttlSec * 1000 * 0.8) : 0;
-
-    const ttlMs = Math.max(
-      Math.min(ECH_REFRESH_MS, ttlMsFromDns || ECH_REFRESH_MS)
-    );
-
-    ECH_CACHE.value = ech || null;
-    ECH_CACHE.expiresAt = Date.now() + ttlMs;
-    return ECH_CACHE.value;
-  })().finally(() => {
-    ECH_CACHE.inFlight = null;
-  });
-
-  return ECH_CACHE.inFlight;
-}
-
-async function fetchECHNoStale() {
-  const qs = `name=${encodeURIComponent(ECH_NAME)}&type=65&_=${Date.now()}`;
-
+/** 尽量短：只查 cloudflare-ech.com 的 65 记录，提取 ech=... */
+async function fetchECH() {
   const tries = [
-    [`https://cloudflare-dns.com/dns-query?${qs}`, "application/dns-json"],
-    [`https://dns.google/resolve?${qs}`, "application/json"],
+    ["https://cloudflare-dns.com/dns-query?name=cloudflare-ech.com&type=65", "application/dns-json"],
+    ["https://dns.google/resolve?name=cloudflare-ech.com&type=65", "application/json"],
   ];
 
   for (const [u, accept] of tries) {
     try {
       const r = await fetch(u, {
-        headers: {
-          Accept: accept,
-          "Cache-Control": "no-cache",
-          Pragma: "no-cache",
-        },
-        cache: "no-cache",
-        cf: { cacheTtl: 0, cacheEverything: false },
+        headers: { Accept: accept },
         signal: AbortSignal.timeout(5000),
       });
-
       if (!r.ok) continue;
       const j = await r.json();
-      const ans = Array.isArray(j?.Answer) ? j.Answer : [];
-
-      let minTtl = null;
-
+      const ans = j?.Answer || [];
       for (const a of ans) {
-        const data = String(a?.data || "");
-        const ech = extractECH(data);
-        if (!ech) continue;
-
-        const t = Number(a?.TTL);
-        if (!Number.isNaN(t) && t > 0) minTtl = minTtl == null ? t : Math.min(minTtl, t);
-
-        return { ech, ttlSec: minTtl };
+        const d = String(a?.data || "");
+        const m = d.match(/ech=([^\s"']+)/);
+        if (m?.[1]) return m[1];
+        // 有些实现会把 data 做 base64，这里兼容一下
+        try {
+          const decoded = atob(d);
+          const m2 = decoded.match(/ech=([^\s"']+)/);
+          if (m2?.[1]) return m2[1];
+        } catch {}
       }
     } catch {}
   }
-
-  return { ech: null, ttlSec: null };
-}
-
-function extractECH(data) {
-  let m = data.match(/ech="?([^"\s]+)"?/i);
-  if (m?.[1]) return m[1];
-
-  const decoded =
-    tryAtob(data) || tryAtob(data.replace(/-/g, "+").replace(/_/g, "/"));
-  if (decoded) {
-    m = decoded.match(/ech="?([^"\s]+)"?/i);
-    if (m?.[1]) return m[1];
-  }
   return null;
 }
-
-function tryAtob(s) {
-  try {
-    return atob(s);
-  } catch {
-    return null;
-  }
-}
-
 
 async function handleWsRequest(request) {
   const pair = new WebSocketPair();

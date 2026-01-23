@@ -93,7 +93,6 @@ async function handleSubscriptionRequest(request, uuid) {
     }
 
     if (finalLinks.length === 0) {
-        const errorRemark = "No Available IPs";
         const wsPath = encodeURIComponent('/?ed=2048');
         const fpValue = enableECH ? 'chrome' : 'randomized';
         const wsParams = new URLSearchParams({

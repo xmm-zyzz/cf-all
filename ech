@@ -6,13 +6,23 @@ const fallbackPort = '443';
 const socks5Config = '';
 
 
-const parsedSocks5Config = {};
-const isSocksEnabled = false;
+// === ECH / TLS / Fingerprint / Clash settings ===
 
 const enableECH = true;
+
 const customDNS = 'https://dns.alidns.com/dns-query';
+
 const customECHDomain = 'cloudflare-ech.com';
-const remoteConfigUrl = 'https://raw.githubusercontent.com/byJoey/test/refs/heads/main/tist.ini';
+
+const forceTLS = true;
+
+const clashConverterService = 'https://url.v1.mk/sub';
+
+
+let echDebugInfo = '';
+
+const parsedSocks5Config = {};
+const isSocksEnabled = false;
 
 const E_INVALID_DATA = atob('aW52YWxpZCBkYXRh');
 const E_INVALID_USER = atob('aW52YWxpZCB1c2Vy');
@@ -42,7 +52,7 @@ export default {
 				return await handleWsRequest(request);
 			} else if (request.method === 'GET') {
 				if (url.pathname === '/') {
-					const successHtml = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>可以了</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background-color:#121212;color:#e0e0e0;text-align:center;}.container{padding:2rem;border-radius:8px;background-color:#1e1e1e;box-shadow:0 4px 6px rgba(0,0,0,0.1);}h1{color:#4caf50;}</style></head><body><div class="container"><h1>可以了</h1><p>www.x-aniu.com</p></div></body></html>`;
+					const successHtml = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale-1.0"><title>可以了</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background-color:#121212;color:#e0e0e0;text-align:center;}.container{padding:2rem;border-radius:8px;background-color:#1e1e1e;box-shadow:0 4px 6px rgba(0,0,0,0.1);}h1{color:#4caf50;}</style></head><body><div class="container"><h1>可以了</h1><p>www.x-aniu.com</p></div></body></html>`;
 					return new Response(successHtml, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 				}
 				if (url.pathname.toLowerCase().includes(`/${subPath}`)) {
@@ -60,35 +70,70 @@ async function handleSubscriptionRequest(request, uuid) {
     const url = new URL(request.url);
     const finalLinks = [];
     const workerDomain = url.hostname;
+
+    const target = (url.searchParams.get('target') || url.searchParams.get('format') || '').toLowerCase();
+    const ua = request.headers.get('User-Agent') || '';
+    const explicitBase64 = target === 'base64';
+    const wantClash = !explicitBase64 && (target === 'clash' || url.searchParams.has('clash') || /clash/i.test(ua));
+
+
+    let echParam = null;
+    if (enableECH) {
+        echParam = `${customECHDomain}+${customDNS}`;
+        const echMode = (url.searchParams.get('echmode') || '').toLowerCase();
+        if (echMode === 'config') {
+            const fetched = await fetchECHConfig(customECHDomain);
+            if (fetched) echParam = fetched;
+        }
+    }
+
     const newIPList = await fetchAndParseNewIPs();
     if (newIPList.length > 0) {
-        finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain));
+        finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain, echParam));
     }
 
-    const target = url.searchParams.get('target') || 'base64';
-
-    if (target.toLowerCase() === 'clash' || target.toLowerCase() === 'clashr') {
-        if (finalLinks.length === 0) {
-            return new Response('# Empty Config', { status: 200, headers: { 'Content-Type': 'text/yaml; charset=utf-8' } });
-        }
-        const clashConfig = await generateClashConfig(finalLinks);
-        return new Response(clashConfig, { headers: { 'Content-Type': 'text/yaml; charset=utf-8' } });
-    } else {
-        if (finalLinks.length === 0) {
-            const errorLink = `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:80?encryption=none&security=none&type=ws&host=error.com&path=%2F#${encodeURIComponent(errorRemark)}`;
-            finalLinks.push(errorLink);
-        }
-        const subscriptionContent = btoa(finalLinks.join('\n'));
-
-        return new Response(subscriptionContent, {
-            headers: {
-                'Content-Type': 'text/plain; charset=utf-8',
-                'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
-                'X-ECH-Status': enableECH ? 'ENABLED' : 'DISABLED',
-                'X-ECH-Config-Length': enableECH ? `${customECHDomain}+${customDNS}`.length : '0'
-            },
+    if (finalLinks.length === 0) {
+        const errorRemark = "No Available IPs";
+        const wsPath = encodeURIComponent('/?ed=2048');
+        const fpValue = enableECH ? 'chrome' : 'randomized';
+        const wsParams = new URLSearchParams({
+            encryption: 'none',
+            security: 'tls',
+            sni: workerDomain,
+            fp: fpValue,
+            type: 'ws',
+            host: workerDomain,
+            path: wsPath,
+            ...(enableECH ? { alpn: 'h3,h2,http/1.1', ech: echParam || `${customECHDomain}+${customDNS}` } : {})
         });
+        const errorLink = `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:443?${wsParams.toString()}#${encodeURIComponent(errorRemark)}`;
+        finalLinks.push(errorLink);
     }
+
+    if (wantClash) {
+        try {
+            const clashConfig = await generateClashConfig(request);
+            return new Response(clashConfig, {
+                headers: {
+                    'Content-Type': 'text/yaml; charset=utf-8',
+                    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                },
+            });
+        } catch (e) {
+            return new Response(String(e?.message || e), {
+                status: 500,
+                headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+            });
+        }
+    }
+
+    const subscriptionContent = btoa(finalLinks.join('\n'));
+    return new Response(subscriptionContent, {
+        headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+        },
+    });
 }
 
 async function fetchAndParseNewIPs() {
@@ -127,163 +172,154 @@ async function fetchAndParseNewIPs() {
     }
 }
 
-function generateLinksFromNewIPs(list, uuid, workerDomain) {
+async function generateClashConfig(request) {
+    const subscriptionUrl = new URL(request.url);
+
+    subscriptionUrl.searchParams.set('target', 'base64');
+    subscriptionUrl.searchParams.delete('clash');
+    subscriptionUrl.searchParams.delete('format');
+
+    const encodedUrl = encodeURIComponent(subscriptionUrl.toString());
+    const converterUrl = `${clashConverterService}?target=clash&url=${encodedUrl}&insert=false&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&new_name=true`;
+
+    const response = await fetch(converterUrl);
+    if (!response.ok) {
+        throw new Error(`订阅转换服务失败: ${response.status}`);
+    }
+
+    let clashConfig = await response.text();
+
+    // 如果启用 ECH：尽量为节点补齐 ech-opts（主要针对 flow mapping 单行格式）
+    if (enableECH) {
+        const echDomain = customECHDomain || 'cloudflare-ech.com';
+        clashConfig = clashConfig.split('\n').map(line => {
+            if (/^\s*-\s*\{/.test(line) && line.includes('name:') && line.includes('server:')) {
+                if (line.includes('ech-opts')) return line;
+                const lastBraceIndex = line.lastIndexOf('}');
+                if (lastBraceIndex > 0) {
+                    const beforeBrace = line.substring(0, lastBraceIndex).trim();
+                    if (beforeBrace.length > 0) {
+                        const needsComma = !beforeBrace.endsWith(',') && !beforeBrace.endsWith('{');
+                        return line.substring(0, lastBraceIndex) +
+                            (needsComma ? ', ' : ' ') +
+                            `ech-opts: {enable: true, query-server-name: ${echDomain}}` +
+                            line.substring(lastBraceIndex);
+                    }
+                }
+            }
+            return line;
+        }).join('\n');
+    }
+
+    clashConfig = clashConfig.replace(/^(\s*nameserver:\s*\n)((?:\s*-\s*[^\n]+\n)*)/m, (match, header) => {
+        const dnsServer = customDNS || 'https://dns.alidns.com/dns-query';
+        return header + `    - ${dnsServer}\n`;
+    });
+
+    return clashConfig;
+}
+
+async function fetchECHConfig(domain) {
+    if (!enableECH) {
+        echDebugInfo = 'ECH 功能已禁用';
+        return null;
+    }
+
+    echDebugInfo = '';
+    const debugSteps = [];
+
+
+    const queryUrls = [
+        `https://v.recipes/dns/dns.google/dns-query?name=${encodeURIComponent(customECHDomain || 'cloudflare-ech.com')}&type=65`,
+        `https://v.recipes/dns/dns.google/dns-query?name=${encodeURIComponent(domain)}&type=65`
+    ];
+
+    try {
+        for (const u of queryUrls) {
+            debugSteps.push(`请求: ${u}`);
+            const r = await fetch(u, { headers: { 'Accept': 'application/json' } });
+            debugSteps.push(`状态: ${r.status}`);
+            if (!r.ok) continue;
+
+            const data = await r.json();
+            if (!data || !data.Answer || !Array.isArray(data.Answer) || data.Answer.length === 0) {
+                debugSteps.push('无 Answer 记录');
+                continue;
+            }
+
+            debugSteps.push(`Answer 数: ${data.Answer.length}`);
+            for (const ans of data.Answer) {
+                if (!ans || !ans.data) continue;
+                const dataStr = typeof ans.data === 'string' ? ans.data : JSON.stringify(ans.data);
+
+                const echMatch = dataStr.match(/ech=([^\s"']+)/);
+                if (echMatch && echMatch[1]) {
+                    echDebugInfo = debugSteps.join('\n') + '\n✅ 成功解析到 ech= 参数';
+                    return echMatch[1];
+                }
+
+                try {
+                    const decoded = atob(String(ans.data));
+                    const decodedMatch = decoded.match(/ech=([^\s"']+)/);
+                    if (decodedMatch && decodedMatch[1]) {
+                        echDebugInfo = debugSteps.join('\n') + '\n✅ base64 解码后解析到 ech= 参数';
+                        return decodedMatch[1];
+                    }
+                } catch (_) {
+                    // ignore
+                }
+            }
+        }
+
+        echDebugInfo = debugSteps.join('\n') + '\n❌ 未解析到 ech= 参数';
+        return null;
+    } catch (e) {
+        echDebugInfo = debugSteps.join('\n') + `\n❌ 请求异常: ${e?.message || e}`;
+        return null;
+    }
+}
+
+function generateLinksFromNewIPs(list, uuid, workerDomain, echParam = null) {
     const links = [];
-    const wsPath = '/?ed=2048';
+    const wsPath = encodeURIComponent('/?ed=2048');
     const proto = 'vless';
+
+    const CF_HTTPS_PORTS = new Set([443, 2053, 2083, 2087, 2096, 8443]);
+    const fallbackTlsPort = parseInt(fallbackPort, 10) || 443;
+
+    const fpValue = enableECH ? 'chrome' : 'randomized';
+
+    const defaultEchParam = `${customECHDomain}+${customDNS}`;
+    const echValue = enableECH ? (echParam || defaultEchParam) : null;
 
     list.forEach(item => {
         const nodeName = item.name;
         const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
 
+        const port = (forceTLS && !CF_HTTPS_PORTS.has(item.port)) ? fallbackTlsPort : item.port;
+
         const params = {
             encryption: 'none',
             security: 'tls',
             sni: workerDomain,
-            fp: 'chrome',
+            fp: fpValue,
             type: 'ws',
             host: workerDomain,
             path: wsPath
         };
 
         if (enableECH) {
-            params.ech = `${customECHDomain}+${customDNS}`;
             params.alpn = 'h3,h2,http/1.1';
+            params.ech = echValue;
         }
 
         const wsParams = new URLSearchParams(params);
-        links.push(`${proto}://${uuid}@${safeIP}:${item.port}?${wsParams.toString()}#${encodeURIComponent(nodeName)}`);
+        links.push(`${proto}://${uuid}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(nodeName)}`);
     });
+
     return links;
 }
 
-function parseLinkToClashNode(link) {
-    try {
-        const url = new URL(link);
-        const params = url.searchParams;
-
-        return {
-            name: url.hash ? decodeURIComponent(url.hash.substring(1)) : url.hostname,
-            type: 'vless',
-            server: url.hostname,
-            port: parseInt(url.port),
-            uuid: url.username,
-            tls: params.get('security') === 'tls',
-            udp: false,
-            sni: params.get('sni'),
-            network: params.get('type'),
-            'client-fingerprint': params.get('fp') || 'chrome',
-            'ws-opts': {
-                path: params.get('path'),
-                headers: {
-                    Host: params.get('host')
-                }
-            },
-            ...(params.get('ech') ? {
-                ech: params.get('ech')
-            } : {})
-        };
-    } catch (e) {
-        return null;
-    }
-}
-async function generateClashConfig(links) {
-    let configContent = "";
-
-    try {
-        const remoteResp = await fetch(remoteConfigUrl);
-        if (remoteResp.ok) {
-            configContent = await remoteResp.text();
-        }
-    } catch (e) {
-        console.log("Fetch remote config failed, using minimal template");
-    }
-
-    const proxies = [];
-    const proxySet = new Set();
-
-    links.forEach(link => {
-        const node = parseLinkToClashNode(link);
-        if (node) {
-            let name = node.name;
-            let counter = 1;
-            while (proxySet.has(name)) {
-                name = `${node.name} ${counter}`;
-                counter++;
-            }
-            proxySet.add(name);
-            node.name = name;
-            proxies.push(node);
-        }
-    });
-
-    // Clash Proxies 段
-    let yamlProxies = "";
-    proxies.forEach(node => {
-        let nodeConfig = `  - name: ${node.name}\n`;
-        nodeConfig += `    type: ${node.type}\n`;
-        nodeConfig += `    server: ${node.server}\n`;
-        nodeConfig += `    port: ${node.port}\n`;
-        nodeConfig += `    uuid: ${node.uuid}\n`;
-        nodeConfig += `    tls: ${node.tls}\n`;
-        nodeConfig += `    sni: ${node.sni}\n`;
-        nodeConfig += `    network: ${node.network}\n`;
-        nodeConfig += `    udp: ${node.udp}\n`;
-
-        if (node['client-fingerprint']) {
-            nodeConfig += `    client-fingerprint: ${node['client-fingerprint']}\n`;
-        }
-
-        if (node['ws-opts']) {
-            nodeConfig += `    ws-opts:\n`;
-            nodeConfig += `      path: ${node['ws-opts'].path}\n`;
-            nodeConfig += `      headers:\n`;
-            nodeConfig += `        Host: ${node['ws-opts'].headers.Host}\n`;
-        }
-
-        if (node['ech']) {
-            nodeConfig += `    ech: "${node['ech']}"\n`;
-        }
-
-        yamlProxies += nodeConfig;
-    });
-
-    if (configContent.includes('proxies:')) {
-        const lines = configContent.split('\n');
-        let newConfig = [];
-        let inProxies = false;
-        let proxiesReplaced = false;
-        let foundNextKey = false;
-
-        for (let line of lines) {
-            if (!proxiesReplaced && line.trim().startsWith('proxies:')) {
-                inProxies = true;
-                newConfig.push(line);
-                newConfig.push(yamlProxies);
-                proxiesReplaced = true;
-            } else if (inProxies) {
-                if (line.trim() === '' || line.startsWith('  ') || line.startsWith('\t')) {
-                    continue;
-                } else {
-                    inProxies = false;
-                    foundNextKey = true;
-                }
-            }
-
-            if (!inProxies && !proxiesReplaced) {
-                newConfig.push(line);
-            } else if (foundNextKey) {
-                newConfig.push(line);
-            }
-        }
-        return newConfig.join('\n');
-    } else {
-        if (!configContent.includes('port:')) {
-            configContent = `port: 7890\nsocks-port: 7891\nallow-lan: true\nmode: rule\nlog-level: info\n` + configContent;
-        }
-        return configContent + '\nproxies:\n' + yamlProxies;
-    }
-}
 
 async function handleWsRequest(request) {
     const wsPair = new WebSocketPair();
@@ -395,7 +431,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 			async write(chunk, controller) {
 				hasData = true;
 				if (webSocket.readyState !== 1) controller.error(E_WS_NOT_OPEN);
-				if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; }
+				if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; } 
                 else { webSocket.send(chunk); }
 			},
 			abort(reason) { console.error("Readable aborted:", reason); },
@@ -414,7 +450,7 @@ async function forwardUDP(udpChunk, webSocket, respHeader) {
 		await tcpSocket.readable.pipeTo(new WritableStream({
 			async write(chunk) {
 				if (webSocket.readyState === 1) {
-					if (vlessHeader) { webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer()); vlessHeader = null; }
+					if (vlessHeader) { webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer()); vlessHeader = null; } 
                     else { webSocket.send(chunk); }
 				}
 			},
@@ -424,7 +460,7 @@ async function forwardUDP(udpChunk, webSocket, respHeader) {
 
 async function establishSocksConnection(addrType, address, port) {
 	const { username, password, hostname, socksPort } = parsedSocks5Config;
-	const socket = connect({ hostname: port: socksPort });
+	const socket = connect({ hostname, port: socksPort });
 	const writer = socket.writable.getWriter();
 	await writer.write(new Uint8Array(username ? [5, 2, 0, 2] : [5, 1, 0]));
 	const reader = socket.readable.getReader();
@@ -462,7 +498,7 @@ function parseSocksConfig(address) {
 
 function base64ToArray(b64Str) {
     if (!b64Str) return { error: null };
-    try { b64Str = b64Str.replace(/-/g, '+').replace(/_/g, '/'); return { earlyData: Uint8Array.from(atob(b64Str), (c) => c.charCodeAt(0)).buffer, error: null }; }
+    try { b64Str = b64Str.replace(/-/g, '+').replace(/_/g, '/'); return { earlyData: Uint8Array.from(atob(b64Str), (c) => c.charCodeAt(0)).buffer, error: null }; } 
     catch (error) { return { error }; }
 }
 
@@ -476,38 +512,4 @@ function formatIdentifier(arr, offset = 0) {
     const id = (hexTable[arr[offset]]+hexTable[arr[offset+1]]+hexTable[arr[offset+2]]+hexTable[arr[offset+3]]+"-"+hexTable[arr[offset+4]]+hexTable[arr[offset+5]]+"-"+hexTable[arr[offset+6]]+hexTable[arr[offset+7]]+"-"+hexTable[arr[offset+8]]+hexTable[arr[offset+9]]+"-"+hexTable[arr[offset+10]]+hexTable[arr[offset+11]]+hexTable[arr[offset+12]]+hexTable[arr[offset+13]]+hexTable[arr[offset+14]]+hexTable[arr[offset+15]]).toLowerCase();
     if (!isValidFormat(id)) throw new TypeError(E_INVALID_ID_STR);
     return id;
-}
-async function fetchECHConfig(domain) {
-    if (!enableECH) {
-        return null;
-    }
-    
-    const targetDomain = domain || customECHDomain;
-    
-    try {
-        const googleDoHUrl = `https://dns.google/dns-query?name=${targetDomain}&type=65`;
-        const response = await fetch(googleDoHUrl, {
-            headers: {
-                'Accept': 'application/dns-json'
-            }
-        });
-        
-        if (response.ok) {
-            const data = await response.json();
-            if (data.Answer && data.Answer.length > 0) {
-                for (const answer of data.Answer) {
-                    if (answer.data && typeof answer.data === 'string') {
-                        const match = answer.data.match(/ech=([^"'\s]+)/);
-                        if (match) {
-                            return match[1];
-                        }
-                    }
-                }
-            }
-        }
-    } catch (error) {
-        console.log("[fetchECHConfig] Google DoH failed:", error);
-    }
-    
-    return null;
 }

@@ -1,4 +1,4 @@
-name: ech-全功能
+name: ech
 
 on:
   workflow_dispatch:
@@ -18,8 +18,8 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Instech-全功能 Obfuscator
-        run: npm instech-全功能 javascript-obfuscator
+      - name: Instech Obfuscator
+        run: npm instech javascript-obfuscator
 
       - name: Obfuscate from local source file
         run: |
@@ -28,12 +28,12 @@ jobs:
             const fs = require('fs');
             const path = require('path');
             
-            const sourceFileName = 'ech-全功能';
+            const sourceFileName = 'ech';
             const outputFileName = '_worker.js';
             const sourceFilePath = path.join(process.cwd(), sourceFileName);
 
             if (!fs.existsSync(sourceFilePath)) {
-              console.error(`错误：在路径 '$\{sourceFilePath\}' 未找到源文件。请确保您的仓库根目录有名为 'ech-全功能' 的文件。`);
+              console.error(`错误：在路径 '$\{sourceFilePath\}' 未找到源文件。请确保您的仓库根目录有名为 'ech' 的文件。`);
               process.exit(1);
             }
 

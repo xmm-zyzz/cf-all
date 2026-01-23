@@ -82,7 +82,6 @@ function buildVlessLink(uuid, ip, port, name, workerHost, ech) {
   const safeIP = ip.includes(":") ? `[${ip}]` : ip;
   const label = encodeURIComponent(name || `${ip}:${port}`);
 
-  // 启用 ECH 时，用 cloudflare-ech.com 做 SNI（ECHConfig 也来自它）
   const sni = ech ? ECH_SNI : workerHost;
 
   const p = new URLSearchParams({
@@ -91,7 +90,7 @@ function buildVlessLink(uuid, ip, port, name, workerHost, ech) {
     sni,
     fp: ech ? "chrome" : "randomized",
     type: "ws",
-    host: workerHost,     // 仍然用你的 Worker 域名做 HTTP Host，保证路由正确
+    host: workerHost,    
     path: WS_PATH,
   });
 
@@ -111,7 +110,6 @@ async function fetchCsvNodes(csvUrl) {
     const text = (await r.text()).trim().replace(/\r/g, "");
     if (!text) return [];
 
-    // 格式: ip:port#name
     const out = [];
     for (const line of text.split("\n")) {
       const s = line.trim();
@@ -134,13 +132,10 @@ async function getECH() {
   ECH_CACHE.inFlight = (async () => {
     const { ech, ttlSec } = await fetchECHNoStale();
 
-    // 如果 DNS 回了 TTL，就用 TTL 的 80% 作为过期时间，但上限不超过 ECH_REFRESH_MS
-    // 没 TTL 就按 ECH_REFRESH_MS
     const ttlMsFromDns =
       typeof ttlSec === "number" && ttlSec > 0 ? Math.floor(ttlSec * 1000 * 0.8) : 0;
 
     const ttlMs = Math.max(
-      5 * 60 * 1000, // 最少 5 分钟，避免抖动
       Math.min(ECH_REFRESH_MS, ttlMsFromDns || ECH_REFRESH_MS)
     );
 
@@ -154,7 +149,6 @@ async function getECH() {
   return ECH_CACHE.inFlight;
 }
 
-// 强制不走缓存：cache=no-cache + cf.cacheTtl=0 + URL 加时间戳
 async function fetchECHNoStale() {
   const qs = `name=${encodeURIComponent(ECH_NAME)}&type=65&_=${Date.now()}`;
 
@@ -171,9 +165,7 @@ async function fetchECHNoStale() {
           "Cache-Control": "no-cache",
           Pragma: "no-cache",
         },
-        // Workers fetch 仅支持 no-cache/no-store；no-cache 会强制重新验证 :contentReference[oaicite:1]{index=1}
         cache: "no-cache",
-        // cf.cacheTtl=0 表示边缘缓存立即过期 :contentReference[oaicite:2]{index=2}
         cf: { cacheTtl: 0, cacheEverything: false },
         signal: AbortSignal.timeout(5000),
       });
@@ -201,11 +193,9 @@ async function fetchECHNoStale() {
 }
 
 function extractECH(data) {
-  // 兼容：ech=xxx / ech="xxx"
   let m = data.match(/ech="?([^"\s]+)"?/i);
   if (m?.[1]) return m[1];
 
-  // 有些实现会把 data 做 base64/base64url，尝试解一下再提取
   const decoded =
     tryAtob(data) || tryAtob(data.replace(/-/g, "+").replace(/_/g, "/"));
   if (decoded) {

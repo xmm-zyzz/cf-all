@@ -1,21 +1,24 @@
 import { connect } from 'cloudflare:sockets';
 
+// --- 硬编码配置 ---
+// UUID，同时用作订阅路径。
 const authToken = 'e258977b-e413-4718-a3af-02d75492c349';
+// 用来访问cloudflare托管的网站
 const fallbackAddress = 'all.ai9527.top';
+// 备用端口。
 const fallbackPort = '443';
+// SOCKS5 代理配置。留空则禁用。格式: user:pass@host:port
 const socks5Config = '';
 
-const ECH_DEFAULT_ENABLED = true;
-const ECH_DEFAULT_MODE = 'query';
-const ECH_QUERY_NAME_DEFAULT = 'cloudflare-ech.com';
-const ECH_DOH_DEFAULT = 'https://cloudflare-dns.com/dns-query';
-const ECH_CONFIG_TTL_MS = 20 * 60 * 60 * 1000;
-let ECH_MEM_CACHE = { key: '', value: null, fetchedAt: 0 };
 
 const directDomains = [
+    { name: "cloudflare.182682.xyz", domain: "cloudflare.182682.xyz" }, { name: "www.shopify.com", domain: "www.shopify.com" }, { name: "www.udacity.com", domain: "www.udacity.com" },
 ];
+
+
 const parsedSocks5Config = {};
 const isSocksEnabled = false;
+
 const E_INVALID_DATA = atob('aW52YWxpZCBkYXRh');
 const E_INVALID_USER = atob('aW52YWxpZCB1c2Vy');
 const E_UNSUPPORTED_CMD = atob('Y29tbWFuZCBpcyBub3Qgc3VwcG9ydGVk');
@@ -29,6 +32,7 @@ const E_SOCKS_NO_METHOD = atob('bm8gYWNjZXB0YWJsZSBtZXRob2Rz');
 const E_SOCKS_AUTH_NEEDED = atob('c29ja3Mgc2VydmVyIG5lZWRzIGF1dGg=');
 const E_SOCKS_AUTH_FAIL = atob('ZmFpbCB0byBhdXRoIHNvY2tzIHNlcnZlcg==');
 const E_SOCKS_CONN_FAIL = atob('ZmFpbCB0byBvcGVuIHNvY2tzIGNvbm5lY3Rpb24=');
+
 const ADDRESS_TYPE_IPV4 = 1;
 const ADDRESS_TYPE_URL = 2;
 const ADDRESS_TYPE_IPV6 = 3;
@@ -43,7 +47,7 @@ export default {
 				return await handleWsRequest(request);
 			} else if (request.method === 'GET') {
 				if (url.pathname === '/') {
-					const successHtml = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>可以了</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background-color:#121212;color:#e0e0e0;text-align:center;}.container{padding:2rem;border-radius:8px;background-color:#1e1e1e;box-shadow:0 4px 6px rgba(0,0,0,0.1);}h1{color:#4caf50;}</style></head><body><div class="container"><h1>可以了</h1><p>www.x-aniu.com</p></div></body></html>`;
+					const successHtml = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale-1.0"><title>可以了</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background-color:#121212;color:#e0e0e0;text-align:center;}.container{padding:2rem;border-radius:8px;background-color:#1e1e1e;box-shadow:0 4px 6px rgba(0,0,0,0.1);}h1{color:#4caf50;}</style></head><body><div class="container"><h1>可以了</h1><p>www.x-aniu.com</p></div></body></html>`;
 					return new Response(successHtml, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 				}
 				if (url.pathname.toLowerCase().includes(`/${subPath}`)) {
@@ -62,31 +66,20 @@ async function handleSubscriptionRequest(request, uuid) {
     const finalLinks = [];
     const workerDomain = url.hostname;
 
-    const echEnabled = parseBool(url.searchParams.get('ech'), ECH_DEFAULT_ENABLED);
-    const echMode = (url.searchParams.get('echMode') || ECH_DEFAULT_MODE).toLowerCase();
-    const echDomain = (url.searchParams.get('echDomain') || ECH_QUERY_NAME_DEFAULT).trim();
-    const echDoh = (url.searchParams.get('echDoh') || ECH_DOH_DEFAULT).trim();
-    let echParam = null;
-    if (echEnabled) {
-        if (echMode === 'config') {
-            echParam = await getEchConfigCached(echDomain, echDoh);
-            if (!echParam) echParam = buildEchQueryParam(echDomain, echDoh);
-        } else {
-            echParam = buildEchQueryParam(echDomain, echDoh);
-        }
-    }
+    const nativeList = [{ ip: workerDomain, isp: '原生地址' }];
+    finalLinks.push(...generateLinksFromSource(nativeList, uuid, workerDomain));
 
     const domainList = directDomains.map(d => ({ ip: d.domain, isp: d.name || d.domain }));
-    finalLinks.push(...generateLinksFromSource(domainList, uuid, workerDomain, echEnabled, echParam));
+    finalLinks.push(...generateLinksFromSource(domainList, uuid, workerDomain));
 
     const dynamicIPList = await fetchDynamicIPs();
     if (dynamicIPList.length > 0) {
-        finalLinks.push(...generateLinksFromSource(dynamicIPList, uuid, workerDomain, echEnabled, echParam));
+        finalLinks.push(...generateLinksFromSource(dynamicIPList, uuid, workerDomain));
     }
 
     const newIPList = await fetchAndParseNewIPs();
     if (newIPList.length > 0) {
-        finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain, echEnabled, echParam));
+        finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain));
     }
 
     if (finalLinks.length === 0) {
@@ -105,7 +98,7 @@ async function handleSubscriptionRequest(request, uuid) {
     });
 }
 
-function generateLinksFromSource(list, uuid, workerDomain, echEnabled = ECH_DEFAULT_ENABLED, echParam = null) {
+function generateLinksFromSource(list, uuid, workerDomain) {
     const httpsPorts = [443];
     const httpPorts = [];
     const links = [];
@@ -118,9 +111,15 @@ function generateLinksFromSource(list, uuid, workerDomain, echEnabled = ECH_DEFA
 
         httpsPorts.forEach(port => {
             const wsNodeName = `${nodeNameBase}-${port}-WS-TLS`;
-            const p = { encryption: 'none', security: 'tls', sni: workerDomain, fp: echEnabled ? 'chrome' : 'randomized', type: 'ws', host: workerDomain, path: wsPath };
-            if (echEnabled && echParam) { p.alpn = 'h3,h2,http/1.1'; p.ech = echParam; }
-            const wsParams = new URLSearchParams(p);
+            const wsParams = new URLSearchParams({ 
+                encryption: 'none', 
+                security: 'tls', 
+                sni: workerDomain, 
+                fp: 'randomized', 
+                type: 'ws', 
+                host: workerDomain, 
+                path: wsPath 
+            });
             links.push(`${proto}://${uuid}@${safeIP}:${port}?${wsParams.toString()}#${encodeURIComponent(wsNodeName)}`);
         });
 
@@ -140,7 +139,7 @@ function generateLinksFromSource(list, uuid, workerDomain, echEnabled = ECH_DEFA
 }
 
 async function fetchDynamicIPs() {
-    const v4Url1 = "";
+    const v4Url1 = "https://www.wetest.vip/page/cloudflare/address_v4.html";
     let results = [];
 
     try {
@@ -167,22 +166,28 @@ async function fetchDynamicIPs() {
         
         let match;
         while ((match = rowRegex.exec(html)) !== null) {
-            const ip = match[1];
-            const isp = match[2].trim() || ip;
-            results.push({ ip, isp });
+            if (match[1] && match[2]) {
+                results.push({
+                    ip: match[1].trim(),
+                    isp: match[2].trim().replace(/\s/g, '')
+                });
+            }
         }
 
-        console.log(`[Hostmonit] Successfully fetched ${results.length} IPs from fallback source.`);
+        if (results.length > 0) {
+             console.log(`[Hostmonit] Successfully fetched ${results.length} IPs from fallback source.`);
+        } else {
+            console.warn(`[Hostmonit] Warning: Could not parse any IPs from fallback source.`);
+        }
+       
         return results;
-
-    } catch (error) {
-        console.error("[Hostmonit] Error fetching or parsing fallback source:", error);
+    } catch (e) {
+        console.error("[Hostmonit] Failed to fetch from fallback source:", e);
         return [];
     }
 }
 
 async function fetchAndParseWetest(url) {
-    if (!url) return [];
     try {
         const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         if (!response.ok) {
@@ -190,23 +195,35 @@ async function fetchAndParseWetest(url) {
             return [];
         }
         const html = await response.text();
-        const rowRegex = /<tr><td>([\d.:a-fA-F]+)<\/td><td>(.*?)<\/td><\/tr>/g;
         const results = [];
+        const rowRegex = /<tr[\s\S]*?<\/tr>/g;
+        const cellRegex = /<td data-label="线路名称">(.+?)<\/td>[\s\S]*?<td data-label="优选地址">([\d.:a-fA-F]+)<\/td>/;
+
         let match;
         while ((match = rowRegex.exec(html)) !== null) {
-            const ip = match[1];
-            const isp = match[2].trim() || ip;
-            results.push({ ip, isp });
+            const rowHtml = match[0];
+            const cellMatch = rowHtml.match(cellRegex);
+            if (cellMatch && cellMatch[1] && cellMatch[2]) {
+                results.push({
+                    isp: cellMatch[1].trim().replace(/<.*?>/g, ''),
+                    ip: cellMatch[2].trim()
+                });
+            }
         }
+        
+        if (results.length === 0) {
+            console.warn(`[Wetest] Warning: Could not parse any IPs from ${url}.`);
+        }
+
         return results;
     } catch (error) {
-        console.error("[Wetest] Error parsing wetest:", error);
+        console.error(`[Wetest] Error parsing ${url}:`, error);
         return [];
     }
 }
 
 async function fetchAndParseNewIPs() {
-    const url = "https://ccq.xmma.top/heads/main/hebing.csv?token=CCQ";
+    const url = "https://ccq.xmma.top/heads/main/transformed_result.csv?token=CCQ";
     let results = [];
     try {
         const response = await fetch(url);
@@ -241,7 +258,7 @@ async function fetchAndParseNewIPs() {
     }
 }
 
-function generateLinksFromNewIPs(list, uuid, workerDomain, echEnabled = ECH_DEFAULT_ENABLED, echParam = null) {
+function generateLinksFromNewIPs(list, uuid, workerDomain) {
     const links = [];
     const wsPath = encodeURIComponent('/?ed=2048');
     const proto = 'vless';
@@ -250,14 +267,22 @@ function generateLinksFromNewIPs(list, uuid, workerDomain, echEnabled = ECH_DEFA
         const nodeName = item.name;
         const safeIP = item.ip.includes(':') ? `[${item.ip}]` : item.ip;
 
-        const params = { encryption: 'none', security: 'tls', sni: workerDomain, fp: echEnabled ? 'chrome' : 'randomized', type: 'ws', host: workerDomain, path: wsPath };
-        if (echEnabled && echParam) { params.alpn = 'h3,h2,http/1.1'; params.ech = echParam; }
+        const params = {
+            encryption: 'none',
+            security: 'tls',
+            sni: workerDomain,
+            fp: 'randomized',
+            type: 'ws',
+            host: workerDomain,
+            path: wsPath
+        };
 
         const wsParams = new URLSearchParams(params);
         links.push(`${proto}://${uuid}@${safeIP}:${item.port}?${wsParams.toString()}#${encodeURIComponent(nodeName)}`);
     });
     return links;
 }
+
 
 async function handleWsRequest(request) {
     const wsPair = new WebSocketPair();
@@ -369,7 +394,8 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 			async write(chunk, controller) {
 				hasData = true;
 				if (webSocket.readyState !== 1) controller.error(E_WS_NOT_OPEN);
-				if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; } else { webSocket.send(chunk); }
+				if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; } 
+                else { webSocket.send(chunk); }
 			},
 			abort(reason) { console.error("Readable aborted:", reason); },
 		})
@@ -387,7 +413,8 @@ async function forwardUDP(udpChunk, webSocket, respHeader) {
 		await tcpSocket.readable.pipeTo(new WritableStream({
 			async write(chunk) {
 				if (webSocket.readyState === 1) {
-					if (vlessHeader) { webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer()); vlessHeader = null; } else { webSocket.send(chunk); }
+					if (vlessHeader) { webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer()); vlessHeader = null; } 
+                    else { webSocket.send(chunk); }
 				}
 			},
 		}));
@@ -448,98 +475,4 @@ function formatIdentifier(arr, offset = 0) {
     const id = (hexTable[arr[offset]]+hexTable[arr[offset+1]]+hexTable[arr[offset+2]]+hexTable[arr[offset+3]]+"-"+hexTable[arr[offset+4]]+hexTable[arr[offset+5]]+"-"+hexTable[arr[offset+6]]+hexTable[arr[offset+7]]+"-"+hexTable[arr[offset+8]]+hexTable[arr[offset+9]]+"-"+hexTable[arr[offset+10]]+hexTable[arr[offset+11]]+hexTable[arr[offset+12]]+hexTable[arr[offset+13]]+hexTable[arr[offset+14]]+hexTable[arr[offset+15]]).toLowerCase();
     if (!isValidFormat(id)) throw new TypeError(E_INVALID_ID_STR);
     return id;
-}
-
-function parseBool(v, d = false) {
-    if (v === null || v === undefined || v === '') return d;
-    const s = String(v).trim().toLowerCase();
-    if (['1','true','yes','y','on','enable','enabled'].includes(s)) return true;
-    if (['0','false','no','n','off','disable','disabled'].includes(s)) return false;
-    return d;
-}
-
-function buildEchQueryParam(echDomain, dohUrl) {
-    return `${echDomain}+${dohUrl}`;
-}
-
-async function getEchConfigCached(echDomain, dohUrl) {
-    const now = Date.now();
-    const key = `${echDomain}@@${dohUrl || ''}`;
-    if (ECH_MEM_CACHE.key === key && ECH_MEM_CACHE.value && (now - ECH_MEM_CACHE.fetchedAt) < ECH_CONFIG_TTL_MS) return ECH_MEM_CACHE.value;
-    const endpoints = [];
-    if (dohUrl) endpoints.push(dohUrl);
-    if (dohUrl !== 'https://cloudflare-dns.com/dns-query') endpoints.push('https://cloudflare-dns.com/dns-query');
-    endpoints.push('https://dns.google/resolve');
-    const names = ['cloudflare-ech.com'];
-    if (echDomain && echDomain !== 'cloudflare-ech.com') names.push(echDomain);
-    for (const name of names) {
-        for (const ep of endpoints) {
-            const v = await fetchEchConfigFromDoh(name, ep);
-            if (v) {
-                ECH_MEM_CACHE = { key, value: v, fetchedAt: Date.now() };
-                return v;
-            }
-        }
-    }
-    return null;
-}
-
-async function fetchEchConfigFromDoh(name, dohEndpoint) {
-    try {
-        let url;
-        const headers = {};
-        if (dohEndpoint.includes('/resolve')) {
-            url = `${dohEndpoint}?name=${encodeURIComponent(name)}&type=HTTPS`;
-        } else {
-            url = `${dohEndpoint}?name=${encodeURIComponent(name)}&type=65`;
-            headers['Accept'] = 'application/dns-json';
-        }
-        const resp = await fetch(url, { headers });
-        if (!resp.ok) return null;
-        const data = await resp.json();
-        const answers = data.Answer || data.answer || [];
-        if (!Array.isArray(answers) || answers.length === 0) return null;
-        for (const ans of answers) {
-            const raw = ans.data ?? ans.rdata ?? '';
-            if (!raw) continue;
-            const v = extractEchFromHttpsRdata(raw);
-            if (v) return v;
-        }
-        return null;
-    } catch (_) {
-        return null;
-    }
-}
-
-function extractEchFromHttpsRdata(rdata) {
-    const s = String(rdata);
-    const m = s.match(/(?:^|\s)ech=([^\s"']+)/i) || s.match(/(?:^|\s)ech="([^"]+)"/i) || s.match(/(?:^|\s)echconfig=([^\s"']+)/i);
-    if (m?.[1]) return m[1].trim();
-    return null;
-}
-
-const HEX = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
-function bytesToUuid(arr, o) {
-  return (
-    HEX[arr[o]] +
-    HEX[arr[o + 1]] +
-    HEX[arr[o + 2]] +
-    HEX[arr[o + 3]] +
-    "-" +
-    HEX[arr[o + 4]] +
-    HEX[arr[o + 5]] +
-    "-" +
-    HEX[arr[o + 6]] +
-    HEX[arr[o + 7]] +
-    "-" +
-    HEX[arr[o + 8]] +
-    HEX[arr[o + 9]] +
-    "-" +
-    HEX[arr[o + 10]] +
-    HEX[arr[o + 11]] +
-    HEX[arr[o + 12]] +
-    HEX[arr[o + 13]] +
-    HEX[arr[o + 14]] +
-    HEX[arr[o + 15]]
-  );
 }

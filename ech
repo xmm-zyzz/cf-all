@@ -6,13 +6,11 @@ const fallbackPort = '443';
 const socks5Config = '';
 
 const ECH_DEFAULT_ENABLED = true;
-const ECH_DEFAULT_MODE = 'query';  // 'query' | 'config'
+const ECH_DEFAULT_MODE = 'query';
 const ECH_QUERY_NAME_DEFAULT = 'cloudflare-ech.com';
 const ECH_DOH_DEFAULT = 'https://cloudflare-dns.com/dns-query';
-const ECH_CACHE_TTL_MS = 20 * 60 * 60 * 1000; // 20 hours
-
+const ECH_CONFIG_TTL_MS = 20 * 60 * 60 * 1000;
 let ECH_MEM_CACHE = { key: '', value: null, fetchedAt: 0 };
-
 
 const parsedSocks5Config = {};
 const isSocksEnabled = false;
@@ -49,7 +47,7 @@ export default {
 					return new Response(successHtml, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 				}
 				if (url.pathname.toLowerCase().includes(`/${subPath}`)) {
-					return await handleSubscriptionRequest(request, authToken, ctx);
+					return await handleSubscriptionRequest(request, authToken);
 				}
 			}
 			return new Response('Not Found', { status: 404 });
@@ -59,7 +57,7 @@ export default {
 	},
 };
 
-async function handleSubscriptionRequest(request, uuid, ctx) {
+async function handleSubscriptionRequest(request, uuid) {
     const url = new URL(request.url);
     const finalLinks = [];
     const workerDomain = url.hostname;
@@ -72,31 +70,24 @@ async function handleSubscriptionRequest(request, uuid, ctx) {
     let echParam = null;
     if (echEnabled) {
         if (echMode === 'config') {
-            echParam = await getEchConfigAuto(ctx, echDomain, echDoh);
+            echParam = await getEchConfigCached(echDomain, echDoh);
 
             if (!echParam) echParam = buildEchQueryParam(echDomain, echDoh);
         } else {
-            // 默认 query 模式：不会因为 ECHConfig 轮换而失效
             echParam = buildEchQueryParam(echDomain, echDoh);
         }
     }
 
-
     const newIPList = await fetchAndParseNewIPs();
     if (newIPList.length > 0) {
-        finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain, echParam, echEnabled));
+        finalLinks.push(...generateLinksFromNewIPs(newIPList, uuid, workerDomain, echEnabled, echParam));
     }
 
-    if (finalLinks.length === 0) {
-        const errorRemark = "No Available IPs"; 
-        const errorLink = `vless://00000000-0000-0000-0000-000000000000@127.0.0.1:80?encryption=none&security=none&type=ws&host=error.com&path=%2F#${encodeURIComponent(errorRemark)}`;
-        finalLinks.push(errorLink);
-    }
-
-    const subscriptionContent = btoa(finalLinks.join('\n'));
     
+    const subscriptionContent = btoa(finalLinks.join('\n'));
+
     return new Response(subscriptionContent, {
-        headers: { 
+        headers: {
             'Content-Type': 'text/plain; charset=utf-8',
             'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
         },
@@ -139,7 +130,7 @@ async function fetchAndParseNewIPs() {
     }
 }
 
-function generateLinksFromNewIPs(list, uuid, workerDomain, echParam = null, echEnabled = ECH_DEFAULT_ENABLED) {
+function generateLinksFromNewIPs(list, uuid, workerDomain, echEnabled = ECH_DEFAULT_ENABLED, echParam = null) {
     const links = [];
     const wsPath = encodeURIComponent('/?ed=2048');
     const proto = 'vless';
@@ -159,7 +150,7 @@ function generateLinksFromNewIPs(list, uuid, workerDomain, echParam = null, echE
         };
 
         if (echEnabled && echParam) {
-            params.alpn = 'h3,h2,http/1.1';
+            params.alpn = params.alpn || 'h3,h2,http/1.1';
             params.ech = echParam;
         }
 
@@ -168,7 +159,6 @@ function generateLinksFromNewIPs(list, uuid, workerDomain, echParam = null, echE
     });
     return links;
 }
-
 
 async function handleWsRequest(request) {
     const wsPair = new WebSocketPair();
@@ -280,7 +270,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc) {
 			async write(chunk, controller) {
 				hasData = true;
 				if (webSocket.readyState !== 1) controller.error(E_WS_NOT_OPEN);
-				if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; } 
+				if (header) { webSocket.send(await new Blob([header, chunk]).arrayBuffer()); header = null; }
                 else { webSocket.send(chunk); }
 			},
 			abort(reason) { console.error("Readable aborted:", reason); },
@@ -299,7 +289,7 @@ async function forwardUDP(udpChunk, webSocket, respHeader) {
 		await tcpSocket.readable.pipeTo(new WritableStream({
 			async write(chunk) {
 				if (webSocket.readyState === 1) {
-					if (vlessHeader) { webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer()); vlessHeader = null; } 
+					if (vlessHeader) { webSocket.send(await new Blob([vlessHeader, chunk]).arrayBuffer()); vlessHeader = null; }
                     else { webSocket.send(chunk); }
 				}
 			},
@@ -347,7 +337,7 @@ function parseSocksConfig(address) {
 
 function base64ToArray(b64Str) {
     if (!b64Str) return { error: null };
-    try { b64Str = b64Str.replace(/-/g, '+').replace(/_/g, '/'); return { earlyData: Uint8Array.from(atob(b64Str), (c) => c.charCodeAt(0)).buffer, error: null }; } 
+    try { b64Str = b64Str.replace(/-/g, '+').replace(/_/g, '/'); return { earlyData: Uint8Array.from(atob(b64Str), (c) => c.charCodeAt(0)).buffer, error: null }; }
     catch (error) { return { error }; }
 }
 
@@ -355,142 +345,6 @@ function isValidFormat(uuid) { return /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89
 
 function closeSocketQuietly(socket) { try { if (socket.readyState === 1 || socket.readyState === 2) socket.close(); } catch (error) {} }
 
-const hexTable = Array.from({ length: 256 }, (v, i) => (i + 256).toString(16).slice(1));
-
-function formatIdentifier(arr, offset = 0) {
-    const id = (hexTable[arr[offset]]+hexTable[arr[offset+1]]+hexTable[arr[offset+2]]+hexTable[arr[offset+3]]+"-"+hexTable[arr[offset+4]]+hexTable[arr[offset+5]]+"-"+hexTable[arr[offset+6]]+hexTable[arr[offset+7]]+"-"+hexTable[arr[offset+8]]+hexTable[arr[offset+9]]+"-"+hexTable[arr[offset+10]]+hexTable[arr[offset+11]]+hexTable[arr[offset+12]]+hexTable[arr[offset+13]]+hexTable[arr[offset+14]]+hexTable[arr[offset+15]]).toLowerCase();
-    if (!isValidFormat(id)) throw new TypeError(E_INVALID_ID_STR);
-    return id;
-}
-
-
-// ---------------------- ECH helpers ----------------------
-function parseBool(v, defaultVal = false) {
-    if (v === null || v === undefined || v === '') return defaultVal;
-    const s = String(v).trim().toLowerCase();
-    if (['1','true','yes','y','on','enable','enabled'].includes(s)) return true;
-    if (['0','false','no','n','off','disable','disabled'].includes(s)) return false;
-    return defaultVal;
-}
-
-function buildEchQueryParam(echDomain, dohUrl) {
-    return `${echDomain}+${dohUrl}`;
-}
-
-async function getEchConfigAuto(ctx, echDomain, dohUrl) {
-    const now = Date.now();
-    const cacheKey = `${echDomain}@@${dohUrl}`;
-
-    if (ECH_MEM_CACHE.key === cacheKey && ECH_MEM_CACHE.value && (now - ECH_MEM_CACHE.fetchedAt) < ECH_CACHE_TTL_MS) {
-        return ECH_MEM_CACHE.value;
-    }
-
-    try {
-        const cache = caches.default;
-        const keyReq = new Request(`https://ech-cache.local/${encodeURIComponent(cacheKey)}`);
-        const cached = await cache.match(keyReq);
-        if (cached) {
-            const obj = await cached.json();
-            if (obj?.value && obj?.fetchedAt && (now - obj.fetchedAt) < ECH_CACHE_TTL_MS) {
-                ECH_MEM_CACHE = { key: cacheKey, value: obj.value, fetchedAt: obj.fetchedAt };
-                return obj.value;
-            }
-        }
-    } catch (_) {
-        // ignore
-    }
-
-    const endpoints = [];
-    if (dohUrl) endpoints.push(dohUrl);
-    if (dohUrl !== 'https://cloudflare-dns.com/dns-query') endpoints.push('https://cloudflare-dns.com/dns-query');
-    endpoints.push('https://dns.google/resolve');
-
-    const names = ['cloudflare-ech.com'];
-    if (echDomain && echDomain !== 'cloudflare-ech.com') names.push(echDomain);
-
-    for (const name of names) {
-        for (const ep of endpoints) {
-            const v = await fetchEchConfigFromDoh(name, ep);
-            if (v) {
-                const fetchedAt = Date.now();
-                ECH_MEM_CACHE = { key: cacheKey, value: v, fetchedAt };
-
-                try {
-                    const cache = caches.default;
-                    const keyReq = new Request(`https://ech-cache.local/${encodeURIComponent(cacheKey)}`);
-                    const body = JSON.stringify({ value: v, fetchedAt });
-                    const resp = new Response(body, {
-                        headers: {
-                            'Content-Type': 'application/json; charset=utf-8',
-                            'Cache-Control': `public, max-age=${Math.floor(ECH_CACHE_TTL_MS / 1000)}`
-                        }
-                    });
-                    if (ctx?.waitUntil) ctx.waitUntil(cache.put(keyReq, resp));
-                } catch (_) {
-                    // ignore
-                }
-
-                return v;
-            }
-        }
-    }
-
-    return null;
-}
-
-async function fetchEchConfigFromDoh(name, dohEndpoint) {
-    try {
-        let url;
-        let headers = {};
-
-        if (dohEndpoint.includes('/resolve')) {
-            url = `${dohEndpoint}?name=${encodeURIComponent(name)}&type=HTTPS`;
-        } else {
-            url = `${dohEndpoint}?name=${encodeURIComponent(name)}&type=65`;
-            headers['Accept'] = 'application/dns-json';
-        }
-
-        const resp = await fetch(url, { headers });
-        if (!resp.ok) return null;
-
-        const data = await resp.json();
-        const answers = data.Answer || data.answer || [];
-        if (!Array.isArray(answers) || answers.length === 0) return null;
-
-        for (const ans of answers) {
-            const raw = ans.data ?? ans.rdata ?? '';
-            if (!raw) continue;
-            const v = extractEchFromHttpsRdata(raw);
-            if (v) return v;
-        }
-
-        for (const ans of answers) {
-            const raw = ans.data ?? '';
-            if (!raw || typeof raw !== 'string') continue;
-            if (raw.includes('ech=')) continue;
-            try {
-                const decoded = atob(raw);
-                const v = extractEchFromHttpsRdata(decoded);
-                if (v) return v;
-            } catch (_) {
-            }
-        }
-
-        return null;
-    } catch (_) {
-        return null;
-    }
-}
-
-function extractEchFromHttpsRdata(rdata) {
-    const s = String(rdata);
-    const m =
-        s.match(/(?:^|\s)ech=([^\s"']+)/i) ||
-        s.match(/(?:^|\s)ech="([^"]+)"/i) ||
-        s.match(/(?:^|\s)echconfig=([^\s"']+)/i);
-    if (m?.[1]) return m[1].trim();
-    return null;
-}
 const HEX = Array.from({ length: 256 }, (_, i) => (i + 256).toString(16).slice(1));
 function bytesToUuid(arr, o) {
   return (
@@ -517,3 +371,93 @@ function bytesToUuid(arr, o) {
   );
 }
 
+function formatIdentifier(arr, offset = 0) {
+  const id = bytesToUuid(arr, offset).toLowerCase();
+  if (!isValidFormat(id)) throw new TypeError(E_INVALID_ID_STR);
+  return id;
+}
+
+function parseBool(v, defaultVal = false) {
+    if (v === null || v === undefined || v === '') return defaultVal;
+    const s = String(v).trim().toLowerCase();
+    if (['1','true','yes','y','on','enable','enabled'].includes(s)) return true;
+    if (['0','false','no','n','off','disable','disabled'].includes(s)) return false;
+    return defaultVal;
+}
+
+function buildEchQueryParam(echDomain, dohUrl) {
+    return `${echDomain}+${dohUrl}`;
+}
+
+async function getEchConfigCached(echDomain, dohUrl) {
+    const now = Date.now();
+    const cacheKey = `${echDomain}@@${dohUrl}`;
+
+    if (ECH_MEM_CACHE.key === cacheKey && ECH_MEM_CACHE.value && (now - ECH_MEM_CACHE.fetchedAt) < ECH_CONFIG_TTL_MS) {
+        return ECH_MEM_CACHE.value;
+    }
+
+    const endpoints = [];
+    if (dohUrl) endpoints.push(dohUrl);
+    if (dohUrl !== ECH_DOH_DEFAULT) endpoints.push(ECH_DOH_DEFAULT);
+    endpoints.push('https://dns.google/resolve');
+
+    const names = [ECH_QUERY_NAME_DEFAULT];
+    if (echDomain && echDomain !== ECH_QUERY_NAME_DEFAULT) names.push(echDomain);
+
+    for (const name of names) {
+        for (const ep of endpoints) {
+            const v = await fetchEchConfigFromDoh(name, ep);
+            if (v) {
+                ECH_MEM_CACHE = { key: cacheKey, value: v, fetchedAt: Date.now() };
+                return v;
+            }
+        }
+    }
+
+    return null;
+}
+
+async function fetchEchConfigFromDoh(name, dohEndpoint) {
+    try {
+        let url;
+        const headers = {};
+
+        if (dohEndpoint.includes('/resolve')) {
+            url = `${dohEndpoint}?name=${encodeURIComponent(name)}&type=HTTPS`;
+        } else {
+
+            url = `${dohEndpoint}?name=${encodeURIComponent(name)}&type=65`;
+            headers['Accept'] = 'application/dns-json';
+        }
+
+        const resp = await fetch(url, { headers });
+        if (!resp.ok) return null;
+        const data = await resp.json();
+
+        const answers = data.Answer || data.answer || [];
+        if (!Array.isArray(answers) || answers.length === 0) return null;
+
+        for (const ans of answers) {
+            const raw = ans.data ?? ans.rdata ?? '';
+            if (!raw) continue;
+            const v = extractEchFromHttpsRdata(raw);
+            if (v) return v;
+        }
+
+        return null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function extractEchFromHttpsRdata(rdata) {
+    const s = String(rdata);
+
+    const m =
+        s.match(/(?:^|\s)ech=([^\s"']+)/i) ||
+        s.match(/(?:^|\s)ech="([^"]+)"/i) ||
+        s.match(/(?:^|\s)echconfig=([^\s"']+)/i);
+    if (m?.[1]) return m[1].trim();
+    return null;
+}

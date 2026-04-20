@@ -8,7 +8,7 @@ on:
     paths:
       - '明文源吗' # 仅当该源文件修改时触发
  # schedule: # 新增：每3小时自动运行一次（UTC时区）
- #   - cron: '0 */3 * * *'
+    - cron: '0 */3 * * *'
 
 jobs:
   build-and-obfuscate:
